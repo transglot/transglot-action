@@ -1,0 +1,246 @@
+name: transglot
+description: >-
+  Push source translation files to a transglot server, optionally wait for
+  the AI batch to finish, pull translated files back, and commit or upload them.
+branding:
+  icon: globe
+  color: blue
+
+inputs:
+  token:
+    description: transglot project access token (tgl_...). Store it as a repository secret.
+    required: true
+  url:
+    description: Server base URL. Optional when transglot.json already carries "url".
+    required: false
+    default: ''
+  wait:
+    description: '"true" to wait for the AI batch after push, "false" to fire and forget.'
+    required: false
+    default: 'true'
+  commit:
+    description: 'What to do with pulled files: "branch" (commit + push), "artifact", or "none".'
+    required: false
+    default: 'branch'
+  cli-version:
+    description: >-
+      transglot CLI version on npm, or a local tarball path — a value starting
+      with ".", "/" or "file:" is treated as a path (how this repo's own CI tests
+      the action pre-publish).
+    required: false
+    default: '0.2.0'
+
+outputs:
+  batch_id:
+    description: Id of the AI batch queued by push; empty when no batch was queued.
+    value: ${{ steps.push.outputs.batch_id }}
+  files_changed:
+    description: Number of files pull actually (re)wrote.
+    value: ${{ steps.pull.outputs.files_changed }}
+
+runs:
+  using: composite
+  steps:
+    # v7 to match ci.yml and to clear the node20 deprecation. This step runs on EVERY
+    # invocation of this composite, so action-e2e exercises it — unlike the
+    # upload-artifact step below, which CI never reaches.
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+
+    - name: Resolve CLI spec and server URL
+      shell: bash
+      env:
+        INPUT_CLI_VERSION: ${{ inputs.cli-version }}
+        INPUT_URL: ${{ inputs.url }}
+      run: |
+        set -euo pipefail
+        # A path-like cli-version (".", "/" or "file:" prefix) is a LOCAL TARBALL.
+        # npm >= 10 refuses to run a bare .tgz PATH ("Permission denied", exit 126) —
+        # it must be handed to npx as a `file:` PACKAGE SPEC so npx installs then runs
+        # the tarball's bin. Normalise: strip any existing `file:` prefix, then always
+        # re-add it. (This mirrors scripts/e2e-cli.sh, which packs+runs `file:$TARBALL`.)
+        # A `@`-scoped name (e.g. the publish-time fallback `@transglot/cli@0.1.0`)
+        # is already a complete npm spec — pass it through UNCHANGED. Only a bare
+        # version (e.g. `0.1.0`) gets the `transglot@` prefix.
+        case "$INPUT_CLI_VERSION" in
+          .* | /* | file:*) spec="file:${INPUT_CLI_VERSION#file:}" ;;
+          @*) spec="${INPUT_CLI_VERSION}" ;;
+          *) spec="transglot@${INPUT_CLI_VERSION}" ;;
+        esac
+        echo "TRANSGLOT_CLI_SPEC=${spec}" >> "$GITHUB_ENV"
+        if [ -n "$INPUT_URL" ]; then
+          printf 'TRANSGLOT_URL=%s\n' "$INPUT_URL" >> "$GITHUB_ENV"
+        fi
+
+    - name: Push source files
+      id: push
+      shell: bash
+      env:
+        TRANSGLOT_TOKEN: ${{ inputs.token }}
+        INPUT_WAIT: ${{ inputs.wait }}
+      run: |
+        set -uo pipefail
+        # GitHub runs this as `bash --noprofile --norc -eo pipefail {0}`, so errexit
+        # is ON by default and `set -uo pipefail` does NOT clear it. Disable it
+        # EXPLICITLY (set +e) — the CLI's exit code is a SIGNAL, not just success/
+        # failure (contracts §6): 0 OK, 3 quota-suppressed (files still synced),
+        # 4 batch finished failed — and 4 is the DEFAULT path since wait defaults to
+        # "true". These informational codes must NOT abort this step before batch_id
+        # is written, or the consumer loses the outputs the whole action exists to
+        # produce. With errexit off, neither the CLI code nor the tee pipe can kill
+        # the step; we capture the CLI's REAL code from ${PIPESTATUS[0]} (the LEFT side
+        # of the pipe — tee always exits 0), stash it for the pull/commit gates and the
+        # status step, and always emit batch_id from whatever was printed.
+        set +e
+        args=(push)
+        if [ "$INPUT_WAIT" = "true" ]; then
+          args+=(--wait)
+        fi
+        npx --yes "$TRANSGLOT_CLI_SPEC" "${args[@]}" | tee "$RUNNER_TEMP/transglot-push.out"
+        push_code="${PIPESTATUS[0]}"
+        # Pinned CLI line (contracts §5): push prints `Batch: #<id>` when a batch exists.
+        batch_id="$(sed -n 's/^Batch: #\([0-9][0-9]*\).*/\1/p' "$RUNNER_TEMP/transglot-push.out" | head -n 1)"
+        echo "batch_id=${batch_id}" >> "$GITHUB_OUTPUT"
+        # Carry the push signal to the pull/commit gates and the final status step.
+        echo "TRANSGLOT_PUSH_CODE=${push_code}" >> "$GITHUB_ENV"
+        echo "push CLI exit code: ${push_code} (batch_id='${batch_id}')"
+
+    - name: Pull translated files
+      id: pull
+      # Runs unconditionally (always()) so files_changed and paths ALWAYS bind to this
+      # step id — even on a hard push error where the CLI is not re-invoked. The
+      # push-code gate lives INSIDE the step, not in `if:`, precisely so the action's
+      # `files_changed` output (mapped to steps.pull.outputs) never resolves empty.
+      if: ${{ always() }}
+      shell: bash
+      env:
+        TRANSGLOT_TOKEN: ${{ inputs.token }}
+        PUSH_CODE: ${{ env.TRANSGLOT_PUSH_CODE }}
+      run: |
+        set -uo pipefail
+        # Disable errexit explicitly (GitHub's shell has it ON via -eo pipefail, and
+        # `set -uo pipefail` does NOT clear it): a non-zero pull must never abort this
+        # step before files_changed is written. The CLI's real exit code comes from
+        # PIPESTATUS[0] (tee always exits 0), captured explicitly.
+        set +e
+        : > "$RUNNER_TEMP/transglot-pull-paths.txt"
+        pull_code=0
+        push_code="${PUSH_CODE:-0}"
+        # Pull is worth attempting whenever files may have landed: push OK (0), a
+        # quota-suppressed batch (3, sources still synced) or a partially/fully failed
+        # batch (4, any completed items are pullable). A hard error (1/2/5/6 =
+        # config/auth/timeout/server) means pull would fail identically — skip the CLI
+        # call, but STILL emit files_changed=0 so the output always resolves.
+        case "$push_code" in
+          0 | 3 | 4)
+            npx --yes "$TRANSGLOT_CLI_SPEC" pull | tee "$RUNNER_TEMP/transglot-pull.out"
+            pull_code="${PIPESTATUS[0]}"
+            # Pinned CLI lines (contracts §5): pull prints exactly `written <path>` /
+            # `unchanged <path>` per file. files_changed = count of written lines.
+            files_changed="$(grep -c '^written ' "$RUNNER_TEMP/transglot-pull.out")"
+            # ALL expanded pull paths (written AND unchanged) — the commit modes below
+            # operate on exactly this set.
+            sed -n 's/^written //p; s/^unchanged //p' "$RUNNER_TEMP/transglot-pull.out" > "$RUNNER_TEMP/transglot-pull-paths.txt"
+            ;;
+          *)
+            files_changed=0
+            echo "pull skipped: push code ${push_code} is a hard error (config/auth/timeout/server); nothing is pullable"
+            ;;
+        esac
+        echo "files_changed=${files_changed}" >> "$GITHUB_OUTPUT"
+        {
+          echo 'paths<<TRANSGLOT_PATHS_EOF'
+          cat "$RUNNER_TEMP/transglot-pull-paths.txt"
+          echo 'TRANSGLOT_PATHS_EOF'
+        } >> "$GITHUB_OUTPUT"
+        echo "TRANSGLOT_PULL_CODE=${pull_code}" >> "$GITHUB_ENV"
+        echo "pull CLI exit code: ${pull_code} (files_changed=${files_changed})"
+
+    - name: Commit pulled files (commit = branch)
+      # Commit whatever pulled files landed for push codes 0/3/4 (quota-suppressed and
+      # partially-failed batches can still yield translated content worth committing).
+      if: ${{ always() && inputs.commit == 'branch' && (env.TRANSGLOT_PUSH_CODE == '0' || env.TRANSGLOT_PUSH_CODE == '3' || env.TRANSGLOT_PUSH_CODE == '4') }}
+      shell: bash
+      env:
+        FILES_CHANGED: ${{ steps.pull.outputs.files_changed }}
+      run: |
+        set -euo pipefail
+        if [ "${FILES_CHANGED:-0}" = "0" ]; then
+          echo "No translation files changed - skipping commit."
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        # git add ONLY the expanded pull paths (contracts §5) — never a blanket add.
+        # A pulled path can legitimately be gitignored (teams often ignore generated
+        # locale bundles). `git add` EXITS 1 on an ignored path, and under the errexit
+        # above that aborted the whole step — so the "Nothing staged (pulled paths
+        # ignored ...)" gate below, which exists precisely to handle that case, was
+        # unreachable for it and the consumer got a red build with a raw git hint
+        # instead of the intended clean skip. Warn and carry on: `git diff --cached`
+        # is the real decision point. NEVER `git add -f` here — the consumer ignored
+        # those paths deliberately.
+        while IFS= read -r path; do
+          if [ -n "$path" ]; then
+            git add -- "$path" || echo "note: could not stage '$path' (gitignored?) - continuing"
+          fi
+        done < "$RUNNER_TEMP/transglot-pull-paths.txt"
+        if git diff --cached --quiet; then
+          echo "Nothing staged (pulled paths ignored or unchanged) - skipping commit."
+          exit 0
+        fi
+        git commit -m "chore(i18n): sync translations from transglot"
+        git push
+
+    # DELIBERATELY still v4 while everything else moved to v7. This step is gated on
+    # `commit == 'artifact'`, and both action-e2e invocations in ci.yml pass
+    # `commit: 'none'` — so CI has never once executed it. Bumping it here would be an
+    # untested change to a customer-facing path, and action-e2e could not be cited as
+    # its regression test. To clear the node20 warning honestly, first add a third
+    # action-e2e invocation with `commit: 'artifact'` that asserts the artifact is
+    # produced, then bump. That also retro-covers a path CI has never run.
+    - name: Upload pulled files (commit = artifact)
+      if: ${{ always() && inputs.commit == 'artifact' && (env.TRANSGLOT_PUSH_CODE == '0' || env.TRANSGLOT_PUSH_CODE == '3' || env.TRANSGLOT_PUSH_CODE == '4') }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: transglot-files
+        path: ${{ steps.pull.outputs.paths }}
+        if-no-files-found: warn
+
+    - name: Report transglot status
+      # Final gate. By now batch_id and files_changed outputs are ALREADY set and the
+      # commit step has had its chance to run, so a batch-failed run still commits
+      # partial translations, populates both outputs, AND surfaces the exit code here.
+      # Result = the strongest signal across push and pull. Precedence (worst wins):
+      # hard errors first (6 server > 2 auth > 1 config > 5 timeout), then the
+      # informational batch/quota signals (4 batch-failed > 3 quota), then 0. The
+      # informational 3/4 are surfaced (non-zero) per spec §6 so CI reflects
+      # "batch failed / quota" — but only AFTER outputs and commit already happened.
+      if: ${{ always() }}
+      shell: bash
+      env:
+        PUSH_CODE: ${{ env.TRANSGLOT_PUSH_CODE }}
+        PULL_CODE: ${{ env.TRANSGLOT_PULL_CODE }}
+      run: |
+        set -euo pipefail
+        # Rank a CLI exit code by severity (higher = worse). Keeps 0 as the floor.
+        rank() {
+          case "$1" in
+            6) echo 60 ;;   # server/network
+            2) echo 50 ;;   # auth
+            1) echo 40 ;;   # config/usage
+            5) echo 30 ;;   # --wait timeout
+            4) echo 20 ;;   # batch finished failed / completed_with_errors / cancelled
+            3) echo 10 ;;   # quota-suppressed
+            *) echo 0  ;;   # 0 / unset → success
+          esac
+        }
+        push_code="${PUSH_CODE:-0}"
+        pull_code="${PULL_CODE:-0}"
+        worst_code="$push_code"
+        if [ "$(rank "$pull_code")" -gt "$(rank "$push_code")" ]; then
+          worst_code="$pull_code"
+        fi
+        echo "transglot result: push=${push_code} pull=${pull_code} -> exit ${worst_code}"
+        exit "$worst_code"
