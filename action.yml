@@ -57,14 +57,24 @@ runs:
         set -euo pipefail
         # A path-like cli-version (".", "/" or "file:" prefix) is a LOCAL TARBALL.
         # npm >= 10 refuses to run a bare .tgz PATH ("Permission denied", exit 126) —
-        # it must be handed to npx as a `file:` PACKAGE SPEC so npx installs then runs
-        # the tarball's bin. Normalise: strip any existing `file:` prefix, then always
-        # re-add it. (This mirrors scripts/e2e-cli.sh, which packs+runs `file:$TARBALL`.)
+        # it must be handed to npm as a `file:` PACKAGE SPEC so npm installs it and
+        # exposes the tarball's bin. Normalise: strip any existing `file:` prefix,
+        # make it ABSOLUTE, then always re-add it. Absolute matters because the
+        # install step below runs with `--prefix` in RUNNER_TEMP, and npm resolves a
+        # relative file: spec against that prefix rather than the workspace — so a
+        # consumer passing `./dist/transglot.tgz` would get ENOENT deep inside npm.
         # A `@`-scoped name (e.g. the publish-time fallback `@transglot/cli@0.1.0`)
         # is already a complete npm spec — pass it through UNCHANGED. Only a bare
         # version (e.g. `0.1.0`) gets the `transglot@` prefix.
         case "$INPUT_CLI_VERSION" in
-          .* | /* | file:*) spec="file:${INPUT_CLI_VERSION#file:}" ;;
+          .* | /* | file:*)
+            raw="${INPUT_CLI_VERSION#file:}"
+            case "$raw" in
+              /*) abs="$raw" ;;
+              *) abs="$(cd "$(dirname "$raw")" && pwd)/$(basename "$raw")" ;;
+            esac
+            spec="file:${abs}"
+            ;;
           @*) spec="${INPUT_CLI_VERSION}" ;;
           *) spec="transglot@${INPUT_CLI_VERSION}" ;;
         esac
@@ -72,6 +82,31 @@ runs:
         if [ -n "$INPUT_URL" ]; then
           printf 'TRANSGLOT_URL=%s\n' "$INPUT_URL" >> "$GITHUB_ENV"
         fi
+
+    - name: Install the transglot CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Install ONCE; push and pull below run the resolved bin directly.
+        #
+        # The push/pull steps used to call `npx --yes "$TRANSGLOT_CLI_SPEC"` each, which
+        # looks free because npx caches its install. With a `file:` tarball spec it is
+        # not: the FIRST call installs in ~10s and every LATER one stalls ~7 MINUTES at
+        # 0% CPU inside npm before running the binary it already had. Two invocations
+        # per drive plus four drives overran action-e2e's 35-minute job timeout and the
+        # runner SIGTERM'd it mid-pull on 2026-09-04 (CI run 33843135447), after all
+        # twenty preceding steps had passed.
+        #
+        # Measured, the stall is specific to `file:` specs, i.e. the tarball this repo's
+        # own CI drives. A registry spec such as `transglot@0.2.0`, which is what a
+        # consumer gets by default, ran 2.7s then 2.4s back to back. Consumers were not
+        # stalling; they simply install once now instead of twice.
+        prefix="$RUNNER_TEMP/transglot-cli"
+        mkdir -p "$prefix"
+        npm install --no-save --no-audit --no-fund --prefix "$prefix" "$TRANSGLOT_CLI_SPEC"
+        bin="$prefix/node_modules/.bin/transglot"
+        [ -x "$bin" ] || { echo "transglot: CLI bin missing at $bin after installing '$TRANSGLOT_CLI_SPEC'" >&2; exit 1; }
+        echo "TRANSGLOT_CLI_BIN=${bin}" >> "$GITHUB_ENV"
 
     - name: Push source files
       id: push
@@ -97,7 +132,7 @@ runs:
         if [ "$INPUT_WAIT" = "true" ]; then
           args+=(--wait)
         fi
-        npx --yes "$TRANSGLOT_CLI_SPEC" "${args[@]}" | tee "$RUNNER_TEMP/transglot-push.out"
+        "$TRANSGLOT_CLI_BIN" "${args[@]}" | tee "$RUNNER_TEMP/transglot-push.out"
         push_code="${PIPESTATUS[0]}"
         # Pinned CLI line (contracts §5): push prints `Batch: #<id>` when a batch exists.
         batch_id="$(sed -n 's/^Batch: #\([0-9][0-9]*\).*/\1/p' "$RUNNER_TEMP/transglot-push.out" | head -n 1)"
@@ -132,9 +167,20 @@ runs:
         # batch (4, any completed items are pullable). A hard error (1/2/5/6 =
         # config/auth/timeout/server) means pull would fail identically — skip the CLI
         # call, but STILL emit files_changed=0 so the output always resolves.
+        # This step is `always()`, so it also runs when the install step FAILED and the
+        # push step was skipped — in which case PUSH_CODE is unset and defaults to 0
+        # above, steering us into the pull branch with no binary to call. Read the bin
+        # through `:-` and gate on it: a bare `$TRANSGLOT_CLI_BIN` would be an unbound
+        # variable, and `set -u` is fatal even with errexit off, which would abort this
+        # step before files_changed is written — the one thing it must never do.
+        cli="${TRANSGLOT_CLI_BIN:-}"
+        if [ -z "$cli" ]; then
+          echo "transglot: the CLI install step did not complete; treating as a hard error"
+          push_code=1
+        fi
         case "$push_code" in
           0 | 3 | 4)
-            npx --yes "$TRANSGLOT_CLI_SPEC" pull | tee "$RUNNER_TEMP/transglot-pull.out"
+            "$cli" pull | tee "$RUNNER_TEMP/transglot-pull.out"
             pull_code="${PIPESTATUS[0]}"
             # Pinned CLI lines (contracts §5): pull prints exactly `written <path>` /
             # `unchanged <path>` per file. files_changed = count of written lines.
