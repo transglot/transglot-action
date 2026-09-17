@@ -28,7 +28,7 @@ inputs:
       with ".", "/" or "file:" is treated as a path (how this repo's own CI tests
       the action pre-publish).
     required: false
-    default: '0.2.0'
+    default: '0.3.0'
 
 outputs:
   batch_id:
