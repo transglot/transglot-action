@@ -1,4 +1,13 @@
-# transglot-action
+<p>
+  <a href="https://transglot.ai">
+    <picture>
+      <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/transglot/transglot-action/main/assets/transglot-logo-dark.png">
+      <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/transglot/transglot-action/main/assets/transglot-logo-light.png">
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/transglot/transglot-action/main/assets/transglot-logo-dark.gif">
+      <img src="https://raw.githubusercontent.com/transglot/transglot-action/main/assets/transglot-logo-light.gif" alt="Transglot — official GitHub Action" width="360" height="90">
+    </picture>
+  </a>
+</p>
 
 **Ship every language on every push.** The official GitHub Action for
 [transglot](https://transglot.ai): it sends your source strings for translation,
