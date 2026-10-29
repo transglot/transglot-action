@@ -1,7 +1,6 @@
 name: transglot
 description: >-
-  Push source translation files to a transglot server, optionally wait for
-  the AI batch to finish, pull translated files back, and commit or upload them.
+  Sync source strings with transglot, wait for AI translations, and commit or upload translated files.
 branding:
   icon: globe
   color: blue
