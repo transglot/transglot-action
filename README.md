@@ -118,7 +118,7 @@ the default read-only `GITHUB_TOKEN` fails there with a 403.
 | `url` | no | `''` | Server base URL. Optional when `transglot.json` already carries `url`. |
 | `wait` | no | `'true'` | `'true'` waits for the batch after push, `'false'` fires and forgets. |
 | `commit` | no | `'branch'` | What to do with pulled files: `branch` (commit and push), `artifact` (upload), or `none`. |
-| `cli-version` | no | `'0.4.0'` | `transglot` CLI version on npm. A value starting with `.`, `/` or `file:` is treated as a local tarball path. |
+| `cli-version` | no | `'0.5.1'` | `transglot` CLI version on npm. A value starting with `.`, `/` or `file:` is treated as a local tarball path. |
 
 ## Outputs
 
